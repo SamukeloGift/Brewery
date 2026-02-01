@@ -92,4 +92,4 @@ if [ "$choice" == "1" ]; then
 else
   echo "------------------------------------------------"
   echo "Setup complete. Command 'br' is now available system-wide."
-fi
+i
