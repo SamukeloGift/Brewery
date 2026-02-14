@@ -38,8 +38,12 @@ BIN_DIR = BASE_DIR / "bin"
 CACHE_DIR = BASE_DIR / "cache"
 INVENTORY_FILE = BASE_DIR / "inventory.json"
 CACHE_DB = CACHE_DIR / "metadata.db"
+CONFIG_FILE = BASE_DIR / "config.json"
+UPDATE_CHECK_FILE = CACHE_DIR / "last_update_check"
 MAX_PARALLEL_DOWNLOADS = 5
 CACHE_TTL_HOURS = 6  
+UPDATE_CHECK_INTERVAL_HOURS = 24  
+GITHUB_REPO = "SamukeloGift/Brewery" 
 HEADERS = {"User-Agent": "BrPackageManager/0.2"}
 REQUEST_TIMEOUT = 15
 RETRY_ATTEMPTS = 3
@@ -61,6 +65,35 @@ def get_os_flavor() -> str:
         return f"{arch}_{name}"
     else:
         raise OSError("Unsupported Operating System")
+
+def compare_versions(v1: str, v2: str) -> int:
+    """
+    Compare two semantic versions.
+    Returns: -1 if v1 < v2, 0 if v1 == v2, 1 if v1 > v2
+    Handles formats like: 0.0.11-alpha, 1.2.3, 2.0.0-beta
+    """
+    def parse_version(v: str) -> tuple:
+        # Remove pre-release tags for comparison
+        base = v.split('-')[0]
+        parts = [int(x) for x in base.split('.')]
+        # Check if pre-release
+        is_prerelease = '-' in v
+        return parts, is_prerelease
+    
+    parts1, pre1 = parse_version(v1)
+    parts2, pre2 = parse_version(v2)
+    
+    # Compare version numbers
+    if parts1 < parts2:
+        return -1
+    elif parts1 > parts2:
+        return 1
+    else:
+        if pre1 and not pre2:
+            return -1
+        elif not pre1 and pre2:
+            return 1
+        return 0
 
 OS_FLAVOR = get_os_flavor()
 
@@ -162,11 +195,16 @@ class MetadataCache:
 
 
 class Brewery:
-    def __init__(self, verbose: bool = False) -> None:
+    def __init__(self, verbose: bool = False, no_auto_update: bool = False) -> None:
         self.console = Console()
         self.verbose = verbose
+        self.no_auto_update = no_auto_update
+        
         for folder in [CELLAR, BIN_DIR, CACHE_DIR]:
             folder.mkdir(parents=True, exist_ok=True)
+        
+        # Load or create configuration
+        self.config = self._load_config()
         
         # Initialize metadata cache
         self.metadata_cache = MetadataCache(CACHE_DB)
@@ -182,6 +220,213 @@ class Brewery:
         
         # Dependency resolution cache (in-memory for session)
         self._dep_resolution_cache: Dict[str, Dict[str, Any]] = {}
+        
+        # Check for package manager updates (unless disabled)
+        if not self.no_auto_update and self.config.get('auto_update', True):
+            self._check_self_update()
+    
+    def _load_config(self) -> Dict[str, Any]:
+        """Load configuration file or create default."""
+        default_config = {
+            'auto_update': True,
+            'cache_ttl_hours': CACHE_TTL_HOURS,
+            'max_parallel_downloads': MAX_PARALLEL_DOWNLOADS,
+            'retry_attempts': RETRY_ATTEMPTS,
+            'github_repo': GITHUB_REPO
+        }
+        
+        if CONFIG_FILE.exists():
+            try:
+                with open(CONFIG_FILE, 'r') as f:
+                    config = json.load(f)
+                    # Merge with defaults
+                    return {**default_config, **config}
+            except (json.JSONDecodeError, IOError):
+                return default_config
+        else:
+            # Create default config file
+            self._save_config(default_config)
+            return default_config
+    
+    def _save_config(self, config: Dict[str, Any]) -> None:
+        """Save configuration to file."""
+        try:
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(config, f, indent=4)
+        except IOError as e:
+            self.log(f"Failed to save config: {e}")
+    
+    def _should_check_for_updates(self) -> bool:
+        """Check if enough time has passed since last update check."""
+        if not UPDATE_CHECK_FILE.exists():
+            return True
+        
+        try:
+            last_check = float(UPDATE_CHECK_FILE.read_text().strip())
+            hours_since = (time.time() - last_check) / 3600
+            return hours_since >= UPDATE_CHECK_INTERVAL_HOURS
+        except (ValueError, IOError):
+            return True
+    
+    def _mark_update_checked(self) -> None:
+        """Record that we checked for updates."""
+        try:
+            UPDATE_CHECK_FILE.write_text(str(time.time()))
+        except IOError:
+            pass
+    
+    def _check_self_update(self) -> None:
+        """Check for package manager updates from GitHub."""
+        if not self._should_check_for_updates():
+            return
+        
+        try:
+            self.log("Checking for package manager updates...")
+            
+            # Fetch latest release from GitHub
+            repo = self.config.get('github_repo', GITHUB_REPO)
+            api_url = f"https://api.github.com/repos/{repo}/releases/latest"
+            
+            resp = requests.get(api_url, headers=HEADERS, timeout=5)
+            
+            if resp.status_code == 200:
+                release = resp.json()
+                latest_version = release['tag_name'].lstrip('v')
+                
+                if compare_versions(VERSION, latest_version) < 0:
+                    # New version available
+                    self.console.print()
+                    self.console.print(Panel(
+                        f"[bold yellow]📦 Update Available![/bold yellow]\n\n"
+                        f"Current version: [red]{VERSION}[/red]\n"
+                        f"Latest version:  [green]{latest_version}[/green]\n\n"
+                        f"Run [bold cyan]br self-update[/bold cyan] to update\n"
+                        f"Or disable auto-check with [dim]br config set auto_update false[/dim]",
+                        title="Package Manager Update",
+                        border_style="yellow"
+                    ))
+                    self.console.print()
+                
+                self._mark_update_checked()
+                
+        except Exception as e:
+            self.log(f"Update check failed: {e}")
+    
+    def self_update(self):
+        """
+        Update the package manager by fetching the latest main.py from GitHub
+        and overwriting the current installation.
+        """
+        import re
+
+        GITHUB_RAW_URL = "https://raw.githubusercontent.com/SamukeloGift/Brewery/main/main.py"
+        
+        # 1. Identify where we are currently running from
+        current_file_path = Path(__file__).resolve()
+        
+        # Check for write permissions (in case of system-level install)
+        if not os.access(current_file_path, os.W_OK):
+            self.console.print(Panel(
+                "[red]Permission Denied: Cannot overwrite current installation.[/red]\n"
+                f"Location: {current_file_path}\n\n"
+                "[yellow]Try running: sudo br self-update[/yellow]",
+                title="Update Failed",
+                border_style="red"
+            ))
+            return
+
+        try:
+            self.console.print("[bold blue]Checking for updates...[/bold blue]")
+            
+            # 2. Download the latest source code
+            resp = requests.get(GITHUB_RAW_URL, headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+            new_content = resp.text
+            
+            # 3. Check versions using Regex
+            # We look for: VERSION = "x.y.z" in the downloaded string
+            remote_version_match = re.search(r'VERSION\s*=\s*["\']([^"\']+)["\']', new_content)
+            
+            if remote_version_match:
+                remote_version = remote_version_match.group(1)
+                if remote_version == VERSION:
+                    self.console.print(f"[green]✓ You are already on the latest version ({VERSION})[/green]")
+                    return
+                self.console.print(f"[bold yellow]Updating from {VERSION} to {remote_version}...[/bold yellow]")
+            else:
+                self.console.print("[yellow]Could not verify remote version, updating anyway...[/yellow]")
+
+            # 4. Create a backup
+            backup_path = current_file_path.with_suffix('.bak')
+            shutil.copy2(current_file_path, backup_path)
+            
+            # 5. Perform the update (Atomic write)
+            # We write to a temp file first, then move it, to prevent corruption if crash happens mid-write
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, dir=current_file_path.parent) as tmp:
+                tmp.write(new_content)
+                tmp_path = Path(tmp.name)
+            
+            # Preserve execution permissions
+            current_mode = current_file_path.stat().st_mode
+            tmp_path.chmod(current_mode)
+            
+            # Move temp file to actual file
+            shutil.move(str(tmp_path), str(current_file_path))
+            
+            self.console.print(Panel(
+                f"[bold green]✓ Successfully updated to {remote_version if remote_version_match else 'latest'}![/bold green]\n"
+                f"Location: {current_file_path}",
+                title="Update Complete",
+                border_style="green"
+            ))
+            
+            # Remove backup if successful
+            if backup_path.exists():
+                backup_path.unlink()
+                
+            # Exit to ensure new code is loaded on next run
+            sys.exit(0)
+
+        except requests.RequestException as e:
+            self.console.print(f"[red]Network error during update: {e}[/red]")
+        except Exception as e:
+            self.console.print(f"[red]Update failed: {e}[/red]")
+            # Attempt restore from backup if things went wrong
+            if 'backup_path' in locals() and backup_path.exists():
+                self.console.print("[yellow]Restoring backup...[/yellow]")
+                shutil.move(str(backup_path), str(current_file_path))    
+
+    def config_get(self, key: Optional[str] = None) -> None:
+        """Display configuration values."""
+        if key:
+            value = self.config.get(key, "Not found")
+            self.console.print(f"[cyan]{key}[/cyan] = [green]{value}[/green]")
+        else:
+            table = Table(title="Configuration", box=box.ROUNDED)
+            table.add_column("Setting", style="cyan")
+            table.add_column("Value", style="green")
+            
+            for k, v in sorted(self.config.items()):
+                table.add_row(k, str(v))
+            
+            self.console.print(table)
+    
+    def config_set(self, key: str, value: str) -> None:
+        """Set a configuration value."""
+        # Parse boolean and numeric values
+        if value.lower() in ['true', 'yes', '1']:
+            parsed_value = True
+        elif value.lower() in ['false', 'no', '0']:
+            parsed_value = False
+        elif value.isdigit():
+            parsed_value = int(value)
+        else:
+            parsed_value = value
+        
+        self.config[key] = parsed_value
+        self._save_config(self.config)
+        self.console.print(f"[green]✓ Set {key} = {parsed_value}[/green]")
+
     
     def shellenv(self):
         """Prints the export command for the user's shell."""
@@ -383,7 +628,8 @@ class Brewery:
         table.add_column("Latest", style="green")
 
         found: bool = False
-        # Fetcg the data using threads, for better performance...
+        
+        # Batch fetch metadata with threading for better performance
         with self.console.status("[bold blue]Checking for updates..."):
             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                 future_to_pkg = {
@@ -413,12 +659,12 @@ class Brewery:
         self.console.print("[bold yellow]\\[ ] Cleaning up...[/bold yellow]")
         bytes_saved = 0
         
-        # Clean old tar-balls
+        # Clean old tarballs
         for tmp_file in BASE_DIR.glob("*.tar.gz"):
             bytes_saved += tmp_file.stat().st_size
             tmp_file.unlink()
         
-        # Clean old versions of 
+        # Clean old versions
         for pkg_folder in CELLAR.iterdir():
             if pkg_folder.is_dir():
                 active_ver = self.inventory.get(pkg_folder.name, {}).get('version')
@@ -428,12 +674,14 @@ class Brewery:
                         bytes_saved += folder_size
                         shutil.rmtree(ver_folder)
         
+        # Clean expired cache entries
         expired_count = self.metadata_cache.clear_expired()
         self.console.print(f"[green]✓ Cleanup complete! Freed {bytes_saved / (1024*1024):.2f} MB[/green]")
         self.console.print(f"[green]✓ Removed {expired_count} expired cache entries[/green]")
 
     def _resolve_graph(self, pkg_name: str, parent_name: str, res_map: Dict[str, Dict[str, Any]]):
         """Resolve dependency graph with session-level caching."""
+        # Check session cache
         if pkg_name in self._dep_resolution_cache:
             cached_result = self._dep_resolution_cache[pkg_name]
             if pkg_name not in res_map:
@@ -538,7 +786,7 @@ class Brewery:
             
             tmp_file = BASE_DIR / f"{pkg}_{version}.tar.gz"
             
-            # Download with retries in case net is slow
+            # Download with retry logic
             for attempt in range(RETRY_ATTEMPTS):
                 try:
                     with requests.get(
@@ -578,7 +826,7 @@ class Brewery:
             # Extract to temp first to handle nesting issues
             with tempfile.TemporaryDirectory() as temp_extract_dir:
                 with tarfile.open(tmp_file, "r:gz") as tar:
-                    tar.extractall(path=temp_extract_dir)
+                    tar.extractall(path=temp_extract_dir, filter='data')
                 
                 extracted_root = Path(temp_extract_dir)
                 if (extracted_root / pkg / version).exists():
@@ -647,6 +895,8 @@ class Brewery:
 def main():
     shared_args = argparse.ArgumentParser(add_help=False)
     shared_args.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
+    shared_args.add_argument("--no-auto-update", action="store_true", 
+                            help="Disable automatic update check for this session")
 
     parser = argparse.ArgumentParser(
         prog="br",
@@ -678,8 +928,23 @@ def main():
     subparsers.add_parser("doctor", parents=[shared_args], conflict_handler='resolve', help="Check system health")
     subparsers.add_parser("shellenv", parents=[shared_args], conflict_handler='resolve', help="Display shell configuration")
     
+    # Cache commands
     subparsers.add_parser("cache-clear", parents=[shared_args], conflict_handler='resolve', help="Clear metadata cache")
     subparsers.add_parser("cache-stats", parents=[shared_args], conflict_handler='resolve', help="Show cache statistics")
+    
+    # Self-update command
+    subparsers.add_parser("self-update", parents=[shared_args], conflict_handler='resolve', help="Update package manager itself")
+    
+    # Config commands
+    p_config = subparsers.add_parser("config", parents=[shared_args], conflict_handler='resolve', help="Manage configuration")
+    p_config_sub = p_config.add_subparsers(dest="config_action", help="Config actions")
+    
+    p_config_get = p_config_sub.add_parser("get", help="Get config value")
+    p_config_get.add_argument("key", nargs="?", help="Config key (optional, shows all if omitted)")
+    
+    p_config_set = p_config_sub.add_parser("set", help="Set config value")
+    p_config_set.add_argument("key", help="Config key")
+    p_config_set.add_argument("value", help="Config value")
     
     args = parser.parse_args()
 
@@ -687,7 +952,7 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    brew = Brewery(verbose=args.verbose)
+    brew = Brewery(verbose=args.verbose, no_auto_update=args.no_auto_update)
 
     if args.command == "install":
         brew.install(args.packages, force=args.force)
@@ -713,6 +978,15 @@ def main():
         brew.cache_clear()
     elif args.command == "cache-stats":
         brew.cache_stats()
+    elif args.command == "self-update":
+        brew.self_update()
+    elif args.command == "config":
+        if args.config_action == "get":
+            brew.config_get(args.key if hasattr(args, 'key') else None)
+        elif args.config_action == "set":
+            brew.config_set(args.key, args.value)
+        else:
+            p_config.print_help()
 
 if __name__ == "__main__":
     main()
